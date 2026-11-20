@@ -117,10 +117,11 @@ registry. The reports are not deleted when the reporter is revoked; they stay
 in storage until their slot is reclaimed (see the cap rule) and their history
 is in events either way.
 
-This costs one `role_of` call per auditor or transcriber report that would
-otherwise be chosen, never for one that already loses on `as_of` or tier, so
-the common case of a fresh valid report is one call and the worst case is
-`2 * MAX_REPORTERS_PER_TIER` calls. The alternative, an admin-only
+`coverage` first picks the report that would win on `as_of` and tier, then
+asks the registry about that one only, and moves to the next only if it no
+longer counts. So a fresh issuer-signed report costs no `role_of` call, a
+fresh auditor or transcriber report costs one, and the worst case (every
+fresher report revoked) is `2 * MAX_REPORTERS_PER_TIER` calls. The alternative, an admin-only
 `void_report`, is cheaper to read but leaves the bad figure in force until a
 maintainer remembers the second step. That gap is what this rule removes.
 
