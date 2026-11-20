@@ -988,6 +988,253 @@ fn a_migrated_reporter_must_still_move_forward() {
     assert_eq!(reports.get(0).unwrap().amount, 3 * UNIT);
 }
 
+// ---- revoked reporters stop counting (#27) ---------------------------------
+
+const DAY: u64 = 86_400;
+
+/// One fully-covering report per tier, freshest at the weakest tier so that
+/// each tier is what decides coverage at its own `min_tier`.
+fn one_report_per_tier(f: &Fixture) {
+    supply(f, 100 * UNIT);
+    post(f, &f.auditor, 100 * UNIT, T0 - 300);
+    post(f, &f.issuer, 100 * UNIT, T0 - 200);
+    post(f, &f.transcriber, 100 * UNIT, T0 - 100);
+}
+
+#[test]
+fn revoking_the_auditor_drops_its_report_at_every_tier() {
+    let f = listed();
+    one_report_per_tier(&f);
+    f.registry.revoke(&f.auditor);
+
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned), None);
+    assert!(!f
+        .ledger
+        .is_covered(&f.sac, &10_000, &DAY, &Tier::AuditorSigned));
+    // Weaker floors are still met by the reports that count.
+    let issuer = f.ledger.coverage(&f.sac, &Tier::IssuerSigned).unwrap();
+    assert_eq!(issuer.tier, Tier::IssuerSigned);
+    assert!(f
+        .ledger
+        .is_covered(&f.sac, &10_000, &DAY, &Tier::IssuerSigned));
+    let any = f.ledger.coverage(&f.sac, &Tier::Transcribed).unwrap();
+    assert_eq!(any.tier, Tier::Transcribed);
+
+    assert_eq!(f.ledger.get_report(&f.sac, &Tier::AuditorSigned), None);
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), 2);
+    assert!(reports.iter().all(|r| r.reporter != f.auditor));
+}
+
+#[test]
+fn revoking_the_transcriber_drops_its_report_at_every_tier() {
+    let f = listed();
+    one_report_per_tier(&f);
+    f.registry.revoke(&f.transcriber);
+
+    // The freshest report overall was the transcription; coverage now falls
+    // back to the issuer's older one.
+    let any = f.ledger.coverage(&f.sac, &Tier::Transcribed).unwrap();
+    assert_eq!(any.tier, Tier::IssuerSigned);
+    assert_eq!(any.report_as_of, T0 - 200);
+    assert_eq!(
+        f.ledger.coverage(&f.sac, &Tier::IssuerSigned).unwrap().tier,
+        Tier::IssuerSigned
+    );
+    assert_eq!(
+        f.ledger
+            .coverage(&f.sac, &Tier::AuditorSigned)
+            .unwrap()
+            .tier,
+        Tier::AuditorSigned
+    );
+    assert_eq!(f.ledger.get_report(&f.sac, &Tier::Transcribed), None);
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 2);
+}
+
+#[test]
+fn a_revoked_transcribers_bad_figure_stops_satisfying_is_covered() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.issuer, 80 * UNIT, T0 - 1_000);
+    // A bad actor posts a fresher, flattering figure.
+    post(&f, &f.transcriber, 120 * UNIT, T0);
+    assert!(f
+        .ledger
+        .is_covered(&f.sac, &10_000, &DAY, &Tier::Transcribed));
+    f.registry.revoke(&f.transcriber);
+    // Immediately, with no action on the ledger.
+    assert!(!f
+        .ledger
+        .is_covered(&f.sac, &10_000, &DAY, &Tier::Transcribed));
+    assert_eq!(
+        f.ledger.coverage(&f.sac, &Tier::Transcribed).unwrap().bps,
+        8_000
+    );
+}
+
+#[test]
+fn issuer_signed_reports_are_unaffected_by_the_registry() {
+    let f = listed();
+    one_report_per_tier(&f);
+    f.registry.revoke(&f.auditor);
+    f.registry.revoke(&f.transcriber);
+    // Even an issuer that was registered and then revoked keeps signing as
+    // the issuer.
+    f.registry.set_reporter(
+        &f.issuer,
+        &Role::Transcriber,
+        &String::from_str(&f.env, "issuer"),
+    );
+    f.registry.revoke(&f.issuer);
+
+    for min_tier in [Tier::Transcribed, Tier::IssuerSigned] {
+        let c = f.ledger.coverage(&f.sac, &min_tier).unwrap();
+        assert_eq!(c.tier, Tier::IssuerSigned);
+        assert!(f.ledger.is_covered(&f.sac, &10_000, &DAY, &min_tier));
+    }
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned), None);
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports.get(0).unwrap().tier, Tier::IssuerSigned);
+}
+
+#[test]
+fn revoking_the_freshest_auditor_falls_back_to_another_auditor() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &f.auditor, 100 * UNIT, T0 - 100);
+    post(&f, &second, 150 * UNIT, T0);
+    f.registry.revoke(&second);
+    let c = f.ledger.coverage(&f.sac, &Tier::AuditorSigned).unwrap();
+    assert_eq!(c.reserves, 100 * UNIT);
+    assert_eq!(
+        f.ledger
+            .get_report(&f.sac, &Tier::AuditorSigned)
+            .unwrap()
+            .reporter,
+        f.auditor
+    );
+}
+
+#[test]
+fn a_report_stops_counting_when_its_reporter_changes_role() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.auditor, 100 * UNIT, T0);
+    f.registry.set_reporter(
+        &f.auditor,
+        &Role::Transcriber,
+        &String::from_str(&f.env, "demoted"),
+    );
+    // The auditor-tier figure is no longer backed by an auditor.
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::Transcribed), None);
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 0);
+}
+
+#[test]
+fn reinstating_a_reporter_restores_its_report() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.auditor, 100 * UNIT, T0);
+    f.registry.revoke(&f.auditor);
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned), None);
+    f.registry.set_reporter(
+        &f.auditor,
+        &Role::Auditor,
+        &String::from_str(&f.env, "Acme Audit"),
+    );
+    assert!(f
+        .ledger
+        .is_covered(&f.sac, &10_000, &DAY, &Tier::AuditorSigned));
+}
+
+#[test]
+fn a_revoked_reporters_slot_is_reclaimed_when_the_tier_is_full() {
+    let f = listed();
+    let mut auditors = std::vec![f.auditor.clone()];
+    for _ in 1..MAX_REPORTERS_PER_TIER {
+        auditors.push(add_reporter(&f, Role::Auditor));
+    }
+    for a in auditors.iter() {
+        post(&f, a, UNIT, T0 - 100);
+    }
+    f.registry.revoke(&auditors[1]);
+    let newcomer = add_reporter(&f, Role::Auditor);
+    post(&f, &newcomer, 2 * UNIT, T0);
+
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), MAX_REPORTERS_PER_TIER);
+    assert!(reports.iter().any(|r| r.reporter == newcomer));
+    // The reclaimed report is gone, not just hidden: reinstating its reporter
+    // does not bring it back.
+    f.registry.set_reporter(
+        &auditors[1],
+        &Role::Auditor,
+        &String::from_str(&f.env, "back"),
+    );
+    assert!(f
+        .ledger
+        .get_reports(&f.sac)
+        .iter()
+        .all(|r| r.reporter != auditors[1]));
+    // ...and with every slot held by a reporter who counts, the tier is full.
+    let res = f.ledger.try_post_reserve(
+        &auditors[1],
+        &f.sac,
+        &UNIT,
+        &T0,
+        &hash(&f.env, 5),
+        &uri(&f.env),
+    );
+    assert_eq!(res, Err(Ok(LedgerError::TooManyReporters.into())));
+}
+
+#[test]
+fn a_revoked_reporters_slot_is_kept_while_the_tier_has_room() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0 - 100);
+    f.registry.revoke(&f.auditor);
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &second, UNIT, T0);
+    // Reinstated before anyone needed the slot: the old report is still there.
+    f.registry.set_reporter(
+        &f.auditor,
+        &Role::Auditor,
+        &String::from_str(&f.env, "back"),
+    );
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 2);
+}
+
+#[test]
+fn a_legacy_report_from_a_revoked_reporter_does_not_count() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    write_legacy(
+        &f,
+        &legacy_report(&f, &f.auditor, Tier::AuditorSigned, 100 * UNIT, T0),
+    );
+    f.registry.revoke(&f.auditor);
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned), None);
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 0);
+}
+
+#[test]
+fn a_revoked_auditor_cannot_post_again() {
+    let f = listed();
+    f.registry.revoke(&f.auditor);
+    let res = f.ledger.try_post_reserve(
+        &f.auditor,
+        &f.sac,
+        &UNIT,
+        &T0,
+        &hash(&f.env, 1),
+        &uri(&f.env),
+    );
+    assert_eq!(res, Err(Ok(LedgerError::NotReporter.into())));
+}
+
 // ---- admin ----------------------------------------------------------------
 
 #[test]
