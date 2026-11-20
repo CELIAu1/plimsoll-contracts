@@ -165,6 +165,14 @@ covered. Withdrawals are never blocked.
 | `withdraw(to: Address, amount: i128)` | to | `i128` new balance | `InvalidAmount`, `InsufficientBalance` | `withdrawn {to} amount` |
 | `balance(of: Address)` | — | `i128` | — | — |
 | `config()` | — | `VaultConfig` | — | — |
+| `can_deposit()` | — | `bool` | — | — |
+
+`can_deposit()` makes the same `is_covered(asset, min_bps, max_age,
+min_tier)` call `deposit` makes, with the stored config, and returns its
+answer. It is true exactly when a positive deposit would pass the coverage
+gate, so a front end can show whether the vault is open without simulating a
+deposit and reading a `NotCovered` failure. It says nothing about the
+depositor's balance or authorisation.
 
 Errors (`VaultError`): `InvalidAmount = 1`, `NotCovered = 2`,
 `InsufficientBalance = 3`.
@@ -182,6 +190,7 @@ Errors (`VaultError`): `InvalidAmount = 1`, `NotCovered = 2`,
 | Maintainer removes a bad actor | `reporter-registry.revoke` |
 | Dashboard shows ratio and freshness | `coverage-ledger.coverage`, `get_supply`, `get_reports` |
 | Lending pool refuses an under-backed asset | `coverage-ledger.is_covered` (see `covered-vault`) |
+| Front end shows whether the vault is taking deposits | `covered-vault.can_deposit` |
 
 ## Out of scope for v0.1
 
