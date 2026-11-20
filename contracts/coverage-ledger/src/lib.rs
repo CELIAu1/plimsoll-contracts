@@ -19,6 +19,10 @@ const MAX_SAC_NAME_LEN: usize = 69;
 const STRKEY_LEN: usize = 56;
 const MAX_CODE_LEN: usize = 12;
 
+/// Most reporters whose figures one asset keeps at one tier. Bounds what
+/// `coverage` reads, and so what every `is_covered` caller pays.
+pub const MAX_REPORTERS_PER_TIER: u32 = 4;
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -26,7 +30,12 @@ enum DataKey {
     Registry,
     Asset(Address),
     Supply(Address),
+    /// v0.1 layout, one report per tier. Read until migrated, never written.
     Report(Address, Tier),
+    /// The latest report from one reporter at one tier: (sac, tier, reporter).
+    ReportBy(Address, Tier, Address),
+    /// Reporters with a `ReportBy` entry at (sac, tier), in first-post order.
+    Reporters(Address, Tier),
 }
 
 #[contracterror]
@@ -45,6 +54,7 @@ pub enum LedgerError {
     StaleReport = 10,
     InvalidUri = 11,
     ImplausibleAmount = 12,
+    TooManyReporters = 13,
 }
 
 #[contractevent]
@@ -160,6 +170,64 @@ fn parse_sac_name(env: &Env, name: &String) -> Option<(String, Address)> {
     Some((code, Address::from_string(&issuer)))
 }
 
+fn reporters(env: &Env, sac: &Address, tier: Tier) -> Vec<Address> {
+    read_persistent(env, &DataKey::Reporters(sac.clone(), tier)).unwrap_or_else(|| Vec::new(env))
+}
+
+/// Every stored report at `tier`: a not-yet-migrated v0.1 entry first, then
+/// the indexed reporters' in first-post order.
+fn reports_at(env: &Env, sac: &Address, tier: Tier) -> Vec<ReserveReport> {
+    let mut out = Vec::new(env);
+    if let Some(legacy) = read_persistent::<ReserveReport>(env, &DataKey::Report(sac.clone(), tier))
+    {
+        out.push_back(legacy);
+    }
+    for reporter in reporters(env, sac, tier).iter() {
+        if let Some(report) =
+            read_persistent::<ReserveReport>(env, &DataKey::ReportBy(sac.clone(), tier, reporter))
+        {
+            out.push_back(report);
+        }
+    }
+    out
+}
+
+/// Move a v0.1 `Report(sac, tier)` entry into the per-reporter layout. Runs
+/// before the first write at a tier, so a legacy key only ever exists while
+/// that tier's index is empty and no report is read twice.
+fn migrate_legacy(env: &Env, sac: &Address, tier: Tier) {
+    let legacy_key = DataKey::Report(sac.clone(), tier);
+    let legacy = match env
+        .storage()
+        .persistent()
+        .get::<_, ReserveReport>(&legacy_key)
+    {
+        Some(report) => report,
+        None => return,
+    };
+    let key = DataKey::ReportBy(sac.clone(), tier, legacy.reporter.clone());
+    if !env.storage().persistent().has(&key) {
+        write_persistent(env, &key, &legacy);
+    }
+    let mut index = reporters(env, sac, tier);
+    if !index.contains(&legacy.reporter) {
+        index.push_front(legacy.reporter.clone());
+        write_persistent(env, &DataKey::Reporters(sac.clone(), tier), &index);
+    }
+    env.storage().persistent().remove(&legacy_key);
+}
+
+/// The freshest report at `tier`, the earliest-posted reporter on a tie.
+fn freshest_at(env: &Env, sac: &Address, tier: Tier) -> Option<ReserveReport> {
+    let mut best: Option<ReserveReport> = None;
+    for report in reports_at(env, sac, tier).iter() {
+        if best.as_ref().is_none_or(|b| report.as_of > b.as_of) {
+            best = Some(report);
+        }
+    }
+    best
+}
+
 fn best_report(env: &Env, sac: &Address, min_tier: Tier) -> Option<ReserveReport> {
     let mut best: Option<ReserveReport> = None;
     // Strongest tier first, so a tie on `as_of` keeps the stronger report.
@@ -167,14 +235,8 @@ fn best_report(env: &Env, sac: &Address, min_tier: Tier) -> Option<ReserveReport
         if tier < min_tier {
             continue;
         }
-        if let Some(report) =
-            read_persistent::<ReserveReport>(env, &DataKey::Report(sac.clone(), tier))
-        {
-            let newer = match &best {
-                Some(current) => report.as_of > current.as_of,
-                None => true,
-            };
-            if newer {
+        if let Some(report) = freshest_at(env, sac, tier) {
+            if best.as_ref().is_none_or(|b| report.as_of > b.as_of) {
                 best = Some(report);
             }
         }
@@ -324,11 +386,22 @@ impl CoverageLedger {
             }
         }
 
-        let key = DataKey::Report(sac.clone(), tier);
+        migrate_legacy(&env, &sac, tier);
+        // Staleness is per reporter: another reporter's figure at this tier,
+        // however recent, does not stop this one being recorded.
+        let key = DataKey::ReportBy(sac.clone(), tier, reporter.clone());
         if let Some(previous) = read_persistent::<ReserveReport>(&env, &key) {
             if as_of <= previous.as_of {
                 panic_with_error!(&env, LedgerError::StaleReport);
             }
+        }
+        let mut index = reporters(&env, &sac, tier);
+        if !index.contains(&reporter) {
+            if index.len() >= MAX_REPORTERS_PER_TIER {
+                panic_with_error!(&env, LedgerError::TooManyReporters);
+            }
+            index.push_back(reporter.clone());
+            write_persistent(&env, &DataKey::Reporters(sac.clone(), tier), &index);
         }
         let report = ReserveReport {
             amount,
@@ -362,20 +435,17 @@ impl CoverageLedger {
         read_persistent(&env, &DataKey::Supply(sac))
     }
 
+    /// The freshest report at `tier`.
     pub fn get_report(env: Env, sac: Address, tier: Tier) -> Option<ReserveReport> {
-        read_persistent(&env, &DataKey::Report(sac, tier))
+        freshest_at(&env, &sac, tier)
     }
 
-    /// Every tier's latest report, strongest first, skipping tiers with none.
-    /// Showing all of them took three calls; this takes one.
+    /// Every stored report, strongest tier first, then first-post order within
+    /// a tier.
     pub fn get_reports(env: Env, sac: Address) -> Vec<ReserveReport> {
         let mut out = Vec::new(&env);
         for tier in Tier::ALL_DESC {
-            if let Some(report) =
-                read_persistent::<ReserveReport>(&env, &DataKey::Report(sac.clone(), tier))
-            {
-                out.push_back(report);
-            }
+            out.append(&reports_at(&env, &sac, tier));
         }
         out
     }

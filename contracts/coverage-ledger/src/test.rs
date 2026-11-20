@@ -681,6 +681,313 @@ fn zero_supply_counts_as_covered() {
     assert_eq!(c.bps, u32::MAX);
 }
 
+// ---- one report per reporter (#26) ---------------------------------------
+
+fn add_reporter(f: &Fixture, role: Role) -> Address {
+    let who = Address::generate(&f.env);
+    f.registry
+        .set_reporter(&who, &role, &String::from_str(&f.env, "extra"));
+    who
+}
+
+fn post(f: &Fixture, who: &Address, amount: i128, as_of: u64) -> Tier {
+    f.ledger
+        .post_reserve(who, &f.sac, &amount, &as_of, &hash(&f.env, 4), &uri(&f.env))
+}
+
+fn supply(f: &Fixture, amount: i128) {
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &amount, &990, &hash(&f.env, 1));
+}
+
+#[test]
+fn two_auditors_reports_coexist_and_coverage_picks_the_freshest() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &f.auditor, 90 * UNIT, T0 - 100);
+    post(&f, &second, 105 * UNIT, T0 - 10);
+
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports.get(0).unwrap().reporter, f.auditor);
+    assert_eq!(reports.get(0).unwrap().amount, 90 * UNIT);
+    assert_eq!(reports.get(1).unwrap().reporter, second);
+
+    let c = f.ledger.coverage(&f.sac, &Tier::AuditorSigned).unwrap();
+    assert_eq!(c.reserves, 105 * UNIT);
+    assert_eq!(c.report_as_of, T0 - 10);
+    assert_eq!(
+        f.ledger
+            .get_report(&f.sac, &Tier::AuditorSigned)
+            .unwrap()
+            .reporter,
+        second
+    );
+
+    // The first auditor's next attestation is fresher again and wins, and the
+    // second auditor's figure is still there.
+    post(&f, &f.auditor, 95 * UNIT, T0);
+    let c = f.ledger.coverage(&f.sac, &Tier::AuditorSigned).unwrap();
+    assert_eq!(c.reserves, 95 * UNIT);
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 2);
+}
+
+#[test]
+fn an_older_figure_from_another_reporter_is_recorded_not_stale() {
+    let f = listed();
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &f.auditor, UNIT, T0);
+    // Under one-report-per-tier this was StaleReport and the figure was lost.
+    post(&f, &second, 2 * UNIT, T0 - 1_000);
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 2);
+    // The fresher figure still decides coverage.
+    assert_eq!(
+        f.ledger
+            .get_report(&f.sac, &Tier::AuditorSigned)
+            .unwrap()
+            .reporter,
+        f.auditor
+    );
+}
+
+#[test]
+fn a_later_transcription_does_not_erase_another_transcribers_figure() {
+    let f = listed();
+    let second = add_reporter(&f, Role::Transcriber);
+    post(&f, &f.transcriber, UNIT, T0 - 100);
+    post(&f, &second, 3 * UNIT, T0);
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), 2);
+    assert!(reports
+        .iter()
+        .any(|r| r.reporter == f.transcriber && r.amount == UNIT));
+}
+
+#[test]
+fn staleness_is_per_reporter() {
+    let f = listed();
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &f.auditor, UNIT, T0 - 10);
+    post(&f, &second, UNIT, T0 - 10);
+    let res = f.ledger.try_post_reserve(
+        &second,
+        &f.sac,
+        &UNIT,
+        &(T0 - 10),
+        &hash(&f.env, 5),
+        &uri(&f.env),
+    );
+    assert_eq!(res, Err(Ok(LedgerError::StaleReport.into())));
+}
+
+#[test]
+fn a_tie_within_a_tier_goes_to_the_first_reporter_to_post() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &f.auditor, 100 * UNIT, T0);
+    post(&f, &second, 50 * UNIT, T0);
+    let c = f.ledger.coverage(&f.sac, &Tier::Transcribed).unwrap();
+    assert_eq!(c.reserves, 100 * UNIT);
+    assert_eq!(
+        f.ledger
+            .get_report(&f.sac, &Tier::AuditorSigned)
+            .unwrap()
+            .reporter,
+        f.auditor
+    );
+}
+
+#[test]
+fn a_tie_across_tiers_still_goes_to_the_stronger_tier() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    let second = add_reporter(&f, Role::Transcriber);
+    post(&f, &f.transcriber, 10 * UNIT, T0);
+    post(&f, &second, 20 * UNIT, T0);
+    post(&f, &f.issuer, 100 * UNIT, T0);
+    let c = f.ledger.coverage(&f.sac, &Tier::Transcribed).unwrap();
+    assert_eq!(c.tier, Tier::IssuerSigned);
+}
+
+#[test]
+fn reporters_per_tier_are_capped() {
+    let f = listed();
+    let mut auditors = std::vec![f.auditor.clone()];
+    for _ in 1..MAX_REPORTERS_PER_TIER {
+        auditors.push(add_reporter(&f, Role::Auditor));
+    }
+    for (i, a) in auditors.iter().enumerate() {
+        post(&f, a, UNIT, T0 - 100 + i as u64);
+    }
+    let one_too_many = add_reporter(&f, Role::Auditor);
+    let res = f.ledger.try_post_reserve(
+        &one_too_many,
+        &f.sac,
+        &UNIT,
+        &T0,
+        &hash(&f.env, 5),
+        &uri(&f.env),
+    );
+    assert_eq!(res, Err(Ok(LedgerError::TooManyReporters.into())));
+
+    // A reporter already holding a slot can still post its next figure.
+    post(&f, &auditors[0], 2 * UNIT, T0);
+    // And the cap is per tier: other tiers are unaffected.
+    post(&f, &f.transcriber, UNIT, T0);
+    assert_eq!(
+        f.ledger.get_reports(&f.sac).len(),
+        MAX_REPORTERS_PER_TIER + 1
+    );
+}
+
+#[test]
+fn reporters_per_tier_are_capped_per_asset() {
+    let f = listed();
+    for _ in 1..MAX_REPORTERS_PER_TIER {
+        let a = add_reporter(&f, Role::Auditor);
+        post(&f, &a, UNIT, T0);
+    }
+    post(&f, &f.auditor, UNIT, T0);
+    // A second asset has its own slots.
+    let other = f
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&f.env))
+        .address();
+    f.ledger.list_asset(&other);
+    let late = add_reporter(&f, Role::Auditor);
+    f.ledger
+        .post_reserve(&late, &other, &UNIT, &T0, &hash(&f.env, 6), &uri(&f.env));
+}
+
+#[test]
+fn a_reporter_whose_role_changes_starts_a_new_entry_at_the_new_tier() {
+    let f = listed();
+    post(&f, &f.transcriber, UNIT, T0 - 100);
+    f.registry.set_reporter(
+        &f.transcriber,
+        &Role::Auditor,
+        &String::from_str(&f.env, "promoted"),
+    );
+    // Not stale: the new figure is at a different tier.
+    let tier = post(&f, &f.transcriber, 2 * UNIT, T0 - 100);
+    assert_eq!(tier, Tier::AuditorSigned);
+    assert_eq!(
+        f.ledger
+            .get_report(&f.sac, &Tier::AuditorSigned)
+            .unwrap()
+            .amount,
+        2 * UNIT
+    );
+}
+
+// ---- v0.1 storage migration ----------------------------------------------
+
+/// Write a report the way the v0.1 ledger stored it: one per tier.
+fn write_legacy(f: &Fixture, report: &ReserveReport) {
+    f.env.as_contract(&f.ledger.address, || {
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Report(f.sac.clone(), report.tier), report);
+    });
+}
+
+fn has_legacy(f: &Fixture, tier: Tier) -> bool {
+    f.env.as_contract(&f.ledger.address, || {
+        f.env
+            .storage()
+            .persistent()
+            .has(&DataKey::Report(f.sac.clone(), tier))
+    })
+}
+
+fn legacy_report(
+    f: &Fixture,
+    reporter: &Address,
+    tier: Tier,
+    amount: i128,
+    as_of: u64,
+) -> ReserveReport {
+    ReserveReport {
+        amount,
+        as_of,
+        posted_at: as_of,
+        tier,
+        reporter: reporter.clone(),
+        doc_hash: hash(&f.env, 8),
+        doc_uri: uri(&f.env),
+    }
+}
+
+#[test]
+fn a_legacy_report_is_read_before_migration() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    let legacy = legacy_report(&f, &f.auditor, Tier::AuditorSigned, 101 * UNIT, T0 - 50);
+    write_legacy(&f, &legacy);
+    assert_eq!(
+        f.ledger.get_report(&f.sac, &Tier::AuditorSigned),
+        Some(legacy.clone())
+    );
+    assert_eq!(f.ledger.get_reports(&f.sac).len(), 1);
+    let c = f.ledger.coverage(&f.sac, &Tier::AuditorSigned).unwrap();
+    assert_eq!(c.bps, 10_100);
+    assert!(f
+        .ledger
+        .is_covered(&f.sac, &10_000, &86_400, &Tier::AuditorSigned));
+}
+
+#[test]
+fn the_first_post_at_a_tier_migrates_its_legacy_report() {
+    let f = listed();
+    let legacy = legacy_report(&f, &f.auditor, Tier::AuditorSigned, UNIT, T0 - 50);
+    write_legacy(&f, &legacy);
+    let issuer_legacy = legacy_report(&f, &f.issuer, Tier::IssuerSigned, UNIT, T0 - 50);
+    write_legacy(&f, &issuer_legacy);
+
+    let second = add_reporter(&f, Role::Auditor);
+    post(&f, &second, 2 * UNIT, T0 - 60);
+
+    assert!(!has_legacy(&f, Tier::AuditorSigned));
+    // Another tier's legacy entry is left until that tier is written.
+    assert!(has_legacy(&f, Tier::IssuerSigned));
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), 3);
+    // Legacy auditor keeps first place in its tier; nothing is counted twice.
+    assert_eq!(reports.get(0).unwrap(), legacy);
+    assert_eq!(reports.get(1).unwrap().reporter, second);
+    assert_eq!(reports.get(2).unwrap(), issuer_legacy);
+    assert_eq!(
+        f.ledger.get_report(&f.sac, &Tier::AuditorSigned),
+        Some(legacy)
+    );
+}
+
+#[test]
+fn a_migrated_reporter_must_still_move_forward() {
+    let f = listed();
+    write_legacy(
+        &f,
+        &legacy_report(&f, &f.auditor, Tier::AuditorSigned, UNIT, T0 - 50),
+    );
+    let res = f.ledger.try_post_reserve(
+        &f.auditor,
+        &f.sac,
+        &UNIT,
+        &(T0 - 50),
+        &hash(&f.env, 5),
+        &uri(&f.env),
+    );
+    assert_eq!(res, Err(Ok(LedgerError::StaleReport.into())));
+    post(&f, &f.auditor, 3 * UNIT, T0 - 49);
+    assert!(!has_legacy(&f, Tier::AuditorSigned));
+    let reports = f.ledger.get_reports(&f.sac);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports.get(0).unwrap().amount, 3 * UNIT);
+}
+
 // ---- admin ----------------------------------------------------------------
 
 #[test]
