@@ -3,8 +3,9 @@ extern crate std;
 use super::*;
 use reporter_registry::{ReporterRegistry, ReporterRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env, String,
+    testutils::{Address as _, AuthorizedFunction, Ledger as _, MockAuth, MockAuthInvoke},
+    xdr::{ScErrorCode, ScErrorType},
+    Address, BytesN, Env, Error, IntoVal, String, Symbol,
 };
 
 const T0: u64 = 1_700_000_000;
@@ -689,4 +690,127 @@ fn transfer_admin_changes_admin() {
     f.ledger.transfer_admin(&next);
     assert_eq!(f.ledger.admin(), next);
     assert_eq!(f.ledger.registry(), f.registry.address);
+}
+
+/// Authorise exactly these `(address, function, args)` calls on the ledger and
+/// nothing else, replacing the fixture's `mock_all_auths`.
+fn authorise_only(f: &Fixture, entries: &[(&Address, &str, soroban_sdk::Vec<soroban_sdk::Val>)]) {
+    let invokes: std::vec::Vec<MockAuthInvoke> = entries
+        .iter()
+        .map(|(_, fn_name, args)| MockAuthInvoke {
+            contract: &f.ledger.address,
+            fn_name,
+            args: args.clone(),
+            sub_invokes: &[],
+        })
+        .collect();
+    let mocks: std::vec::Vec<MockAuth> = entries
+        .iter()
+        .zip(invokes.iter())
+        .map(|((address, _, _), invoke)| MockAuth { address, invoke })
+        .collect();
+    f.env.mock_auths(&mocks);
+}
+
+/// What a client sees when a `require_auth` inside the ledger finds no
+/// matching authorisation: the host reports it against the failing frame.
+fn auth_failure() -> Error {
+    Error::from_type_and_code(ScErrorType::Context, ScErrorCode::InvalidAction)
+}
+
+#[test]
+fn transfer_admin_requires_both() {
+    let f = setup();
+    let admin = f.ledger.admin();
+    let next = Address::generate(&f.env);
+    f.ledger.transfer_admin(&next);
+
+    // Both the outgoing and the incoming admin signed this exact call.
+    let call = AuthorizedFunction::Contract((
+        f.ledger.address.clone(),
+        Symbol::new(&f.env, "transfer_admin"),
+        (next.clone(),).into_val(&f.env),
+    ));
+    let auths = f.env.auths();
+    assert_eq!(auths.len(), 2);
+    for signer in [&admin, &next] {
+        assert!(auths
+            .iter()
+            .any(|(a, inv)| a == signer && inv.function == call));
+    }
+    assert_eq!(f.ledger.admin(), next);
+}
+
+#[test]
+fn transfer_admin_fails_without_the_new_admins_signature() {
+    let f = setup();
+    let admin = f.ledger.admin();
+    let next = Address::generate(&f.env);
+    authorise_only(
+        &f,
+        &[(&admin, "transfer_admin", (next.clone(),).into_val(&f.env))],
+    );
+    assert_eq!(f.ledger.try_transfer_admin(&next), Err(Ok(auth_failure())));
+    assert_eq!(f.ledger.admin(), admin);
+}
+
+#[test]
+fn transfer_admin_fails_without_the_current_admins_signature() {
+    let f = setup();
+    let admin = f.ledger.admin();
+    let next = Address::generate(&f.env);
+    authorise_only(
+        &f,
+        &[(&next, "transfer_admin", (next.clone(),).into_val(&f.env))],
+    );
+    assert_eq!(f.ledger.try_transfer_admin(&next), Err(Ok(auth_failure())));
+    assert_eq!(f.ledger.admin(), admin);
+}
+
+#[test]
+fn old_admin_loses_upgrade_and_transfer_after_transfer() {
+    let f = setup();
+    let old = f.ledger.admin();
+    let next = Address::generate(&f.env);
+    let third = Address::generate(&f.env);
+    let wasm_hash = BytesN::from_array(&f.env, &[7; 32]);
+    authorise_only(
+        &f,
+        &[
+            (&old, "transfer_admin", (next.clone(),).into_val(&f.env)),
+            (&next, "transfer_admin", (next.clone(),).into_val(&f.env)),
+        ],
+    );
+    f.ledger.transfer_admin(&next);
+    assert_eq!(f.ledger.admin(), next);
+
+    // The old admin's signature on upgrade no longer carries any weight.
+    authorise_only(
+        &f,
+        &[(&old, "upgrade", (wasm_hash.clone(),).into_val(&f.env))],
+    );
+    assert_eq!(f.ledger.try_upgrade(&wasm_hash), Err(Ok(auth_failure())));
+
+    // Nor can the old admin hand the role on, even with the recipient's
+    // signature.
+    authorise_only(
+        &f,
+        &[
+            (&old, "transfer_admin", (third.clone(),).into_val(&f.env)),
+            (&third, "transfer_admin", (third.clone(),).into_val(&f.env)),
+        ],
+    );
+    assert_eq!(f.ledger.try_transfer_admin(&third), Err(Ok(auth_failure())));
+    assert_eq!(f.ledger.admin(), next);
+
+    // The new admin can.
+    authorise_only(
+        &f,
+        &[
+            (&next, "transfer_admin", (third.clone(),).into_val(&f.env)),
+            (&third, "transfer_admin", (third.clone(),).into_val(&f.env)),
+        ],
+    );
+    f.ledger.transfer_admin(&third);
+    assert_eq!(f.ledger.admin(), third);
 }
