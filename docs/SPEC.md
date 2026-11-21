@@ -4,6 +4,9 @@ This document is the source of truth for the contract layer. Code that
 disagrees with it is a bug in one or the other; fix whichever is wrong and
 update both in the same pull request.
 
+What every error code means and what a caller should do about it is in
+[ERRORS.md](ERRORS.md). Error numbers are never reused or renumbered.
+
 ## What the contracts do
 
 Plimsoll answers one question about a Stellar-issued asset: *how much of what
@@ -149,6 +152,7 @@ Decides who may speak. Holds no money.
 | `upgrade(wasm_hash: BytesN<32>)` | admin | `()` | — | — |
 
 Errors (`RegistryError`): `ReporterNotFound = 1`, `InvalidName = 2`.
+Causes and remedies: [ERRORS.md](ERRORS.md#registryerror).
 
 ## coverage-ledger
 
@@ -263,6 +267,7 @@ Errors (`LedgerError`): `NotAStellarAsset = 1`, `AlreadyListed = 2`,
 `InvalidAmount = 6`, `FutureLedger = 7`, `StaleLedger = 8`,
 `FutureTimestamp = 9`, `StaleReport = 10`, `InvalidUri = 11`,
 `ImplausibleAmount = 12`, `TooManyReporters = 13`.
+Causes, remedies and the order they are checked in: [ERRORS.md](ERRORS.md#ledgererror).
 
 ### Upgrading a v0.1 deployment
 
@@ -321,7 +326,8 @@ deposit and reading a `NotCovered` failure. It says nothing about the
 depositor's balance or authorisation.
 
 Errors (`VaultError`): `InvalidAmount = 1`, `NotCovered = 2`,
-`InsufficientBalance = 3`.
+`InsufficientBalance = 3`. Causes and remedies, and the asset-contract errors a
+vault call can surface: [ERRORS.md](ERRORS.md#vaulterror).
 
 ## User flow → function map
 

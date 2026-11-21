@@ -62,7 +62,9 @@ reporter-registry  ◀── role_of ──  coverage-ledger  ◀── is_cover
 
 The full function-by-function specification is in [docs/SPEC.md](docs/SPEC.md),
 and the event topic and data layouts every off-chain reader depends on are in
-[docs/EVENTS.md](docs/EVENTS.md).
+[docs/EVENTS.md](docs/EVENTS.md). What each error code means, from
+`Error(Contract, #1)` up, and what a caller should do about it is in
+[docs/ERRORS.md](docs/ERRORS.md).
 
 ### Why it is Stellar-specific
 
