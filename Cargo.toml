@@ -5,6 +5,8 @@ members = [
   "contracts/reporter-registry",
   "contracts/coverage-ledger",
   "contracts/covered-vault",
+  "contracts/upgrade-fixture-registry",
+  "contracts/upgrade-fixture-ledger",
 ]
 
 [workspace.package]
