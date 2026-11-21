@@ -132,3 +132,64 @@ fn set_reporter_without_auth_panics() {
         &String::from_str(&env, "x"),
     );
 }
+
+#[test]
+fn revoke_then_re_add_resets_added_at() {
+    let (env, _admin, client) = setup();
+    let who = Address::generate(&env);
+    client.set_reporter(&who, &Role::Auditor, &String::from_str(&env, "first"));
+    let first_added = client.get_reporter(&who).unwrap().added_at;
+    env.ledger().set_timestamp(1_800_000_000);
+    client.revoke(&who);
+    client.set_reporter(&who, &Role::Transcriber, &String::from_str(&env, "second"));
+    let second_added = client.get_reporter(&who).unwrap().added_at;
+    assert_eq!(second_added, 1_800_000_000);
+    assert_ne!(second_added, first_added);
+}
+
+#[test]
+fn name_exactly_64_bytes_accepted() {
+    let (env, _admin, client) = setup();
+    let who = Address::generate(&env);
+    let name_64 = String::from_str(&env, &"x".repeat(64));
+    client.set_reporter(&who, &Role::Auditor, &name_64);
+    assert_eq!(client.get_reporter(&who).unwrap().name, name_64);
+}
+
+#[test]
+fn name_65_bytes_rejected() {
+    let (env, _admin, client) = setup();
+    let who = Address::generate(&env);
+    let name_65 = String::from_str(&env, &"x".repeat(65));
+    let res = client.try_set_reporter(&who, &Role::Auditor, &name_65);
+    assert_eq!(res, Err(Ok(RegistryError::InvalidName.into())));
+}
+
+#[test]
+fn revoke_without_admin_auth_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(ReporterRegistry, (admin.clone(),));
+    let client = ReporterRegistryClient::new(&env, &id);
+    let who = Address::generate(&env);
+    client.set_reporter(&who, &Role::Auditor, &String::from_str(&env, "a"));
+    // Clear mocked auths for the next call
+    env.mock_auths(&[]);
+    let res = client.try_revoke(&who);
+    assert!(res.is_err());
+    // Reporter should still exist
+    assert_eq!(client.role_of(&who), Some(Role::Auditor));
+}
+
+#[test]
+fn transfer_admin_without_new_admin_auth_fails() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register(ReporterRegistry, (admin.clone(),));
+    let client = ReporterRegistryClient::new(&env, &id);
+    let next = Address::generate(&env);
+    let res = client.try_transfer_admin(&next);
+    assert!(res.is_err());
+    assert_eq!(client.admin(), admin);
+}
