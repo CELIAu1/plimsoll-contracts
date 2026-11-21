@@ -221,6 +221,25 @@ cargo test -p plimsoll-e2e
 
 CI runs it straight after the wasm build.
 
+### Test coverage
+
+CI measures which contract lines the tests reach with
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov). Every pull request
+gets a per-crate table in the `coverage` job's log and on the run's summary
+page, and the full lcov report as the `coverage-lcov` artifact. To produce the
+same report locally:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+
+./scripts/coverage.sh          # target/coverage/lcov.info + per-crate summary
+./scripts/coverage.sh --html   # also target/coverage/html/index.html
+```
+
+Test files are left out of the figures, and so is `tests/e2e`: it runs the
+compiled wasm, which carries no coverage instrumentation.
+
 ## Contributing
 
 Issues labelled [`good first issue`](https://github.com/plimsoll-protocol/plimsoll-contracts/labels/good%20first%20issue)
