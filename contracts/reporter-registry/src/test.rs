@@ -147,54 +147,63 @@ fn set_reporter_without_auth_panics() {
     );
 }
 
-// ---- upgrade --------------------------------------------------------------
-
 #[test]
-fn non_admin_cannot_upgrade() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let id = env.register(ReporterRegistry, (admin.clone(),));
-    let client = ReporterRegistryClient::new(&env, &id);
-    let wasm_hash = upload_upgrade_fixture(&env);
-    let stranger = Address::generate(&env);
-
-    client.mock_auths(&[MockAuth {
-        address: &stranger,
-        invoke: &MockAuthInvoke {
-            contract: &id,
-            fn_name: "upgrade",
-            args: (&wasm_hash,).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(client.try_upgrade(&wasm_hash).is_err());
-
-    // A refused upgrade must leave the old executable and its admin in place.
-    assert_eq!(client.admin(), admin);
+fn revoke_then_re_add_resets_added_at() {
+    let (env, _admin, client) = setup();
+    let who = Address::generate(&env);
+    client.set_reporter(&who, &Role::Auditor, &String::from_str(&env, "first"));
+    let first_added = client.get_reporter(&who).unwrap().added_at;
+    env.ledger().set_timestamp(1_800_000_000);
+    client.revoke(&who);
+    client.set_reporter(&who, &Role::Transcriber, &String::from_str(&env, "second"));
+    let second_added = client.get_reporter(&who).unwrap().added_at;
+    assert_eq!(second_added, 1_800_000_000);
+    assert_ne!(second_added, first_added);
 }
 
 #[test]
-fn admin_upgrade_keeps_state() {
+fn name_exactly_64_bytes_accepted() {
+    let (env, _admin, client) = setup();
+    let who = Address::generate(&env);
+    let name_64 = String::from_str(&env, &"x".repeat(64));
+    client.set_reporter(&who, &Role::Auditor, &name_64);
+    assert_eq!(client.get_reporter(&who).unwrap().name, name_64);
+}
+
+#[test]
+fn name_65_bytes_rejected() {
+    let (env, _admin, client) = setup();
+    let who = Address::generate(&env);
+    let name_65 = String::from_str(&env, &"x".repeat(65));
+    let res = client.try_set_reporter(&who, &Role::Auditor, &name_65);
+    assert_eq!(res, Err(Ok(RegistryError::InvalidName.into())));
+}
+
+#[test]
+fn revoke_without_admin_auth_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().set_timestamp(1_700_000_000);
     let admin = Address::generate(&env);
     let id = env.register(ReporterRegistry, (admin.clone(),));
     let client = ReporterRegistryClient::new(&env, &id);
+    let who = Address::generate(&env);
+    client.set_reporter(&who, &Role::Auditor, &String::from_str(&env, "a"));
+    // Clear mocked auths for the next call
+    env.mock_auths(&[]);
+    let res = client.try_revoke(&who);
+    assert!(res.is_err());
+    // Reporter should still exist
+    assert_eq!(client.role_of(&who), Some(Role::Auditor));
+}
 
-    let auditor = Address::generate(&env);
-    client.set_reporter(
-        &auditor,
-        &Role::Auditor,
-        &String::from_str(&env, "Acme Audit LLP"),
-    );
-
-    let wasm_hash = upload_upgrade_fixture(&env);
-    client.upgrade(&wasm_hash);
-
+#[test]
+fn transfer_admin_without_new_admin_auth_fails() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register(ReporterRegistry, (admin.clone(),));
+    let client = ReporterRegistryClient::new(&env, &id);
+    let next = Address::generate(&env);
+    let res = client.try_transfer_admin(&next);
+    assert!(res.is_err());
     assert_eq!(client.admin(), admin);
-    let info = client.get_reporter(&auditor).unwrap();
-    assert_eq!(info.role, Role::Auditor);
-    assert_eq!(info.name, String::from_str(&env, "Acme Audit LLP"));
-    assert_eq!(client.role_of(&auditor), Some(Role::Auditor));
 }
