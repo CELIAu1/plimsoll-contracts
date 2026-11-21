@@ -3,15 +3,30 @@ extern crate std;
 use super::*;
 use reporter_registry::{ReporterRegistry, ReporterRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env, String,
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, Bytes, BytesN, Env, IntoVal, String,
 };
 
 const T0: u64 = 1_700_000_000;
 const UNIT: i128 = 10_000_000;
 
+fn upgrade_fixture_wasm() -> std::vec::Vec<u8> {
+    const VENDORED: &[u8] =
+        include_bytes!("../../upgrade-fixture-ledger/testdata/upgrade_fixture_ledger.wasm");
+    let built = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target/wasm32v1-none/release/upgrade_fixture_ledger.wasm");
+    std::fs::read(built).unwrap_or_else(|_| VENDORED.to_vec())
+}
+
+fn upload_upgrade_fixture(env: &Env) -> BytesN<32> {
+    env.deployer()
+        .upload_contract_wasm(Bytes::from_slice(env, &upgrade_fixture_wasm()))
+}
+
 struct Fixture {
     env: Env,
+    admin: Address,
     ledger: CoverageLedgerClient<'static>,
     registry: ReporterRegistryClient<'static>,
     sac: Address,
@@ -61,6 +76,7 @@ fn setup() -> Fixture {
 
     Fixture {
         env,
+        admin,
         ledger,
         registry,
         sac,
@@ -689,4 +705,147 @@ fn transfer_admin_changes_admin() {
     f.ledger.transfer_admin(&next);
     assert_eq!(f.ledger.admin(), next);
     assert_eq!(f.ledger.registry(), f.registry.address);
+}
+
+// ---- upgrade --------------------------------------------------------------
+
+#[test]
+fn non_admin_cannot_upgrade() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let registry_id = env.register(ReporterRegistry, (admin.clone(),));
+    let ledger_id = env.register(CoverageLedger, (admin.clone(), registry_id));
+    let ledger = CoverageLedgerClient::new(&env, &ledger_id);
+    let wasm_hash = upload_upgrade_fixture(&env);
+    let stranger = Address::generate(&env);
+
+    ledger.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &ledger_id,
+            fn_name: "upgrade",
+            args: (&wasm_hash,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ledger.try_upgrade(&wasm_hash).is_err());
+
+    // A refused upgrade must leave the old executable and its admin in place.
+    assert_eq!(ledger.admin(), admin);
+}
+
+#[test]
+fn admin_upgrade_keeps_state() {
+    let f = listed();
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    f.ledger.post_reserve(
+        &f.issuer,
+        &f.sac,
+        &(100 * UNIT),
+        &(T0 - 60),
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+
+    let wasm_hash = upload_upgrade_fixture(&f.env);
+    f.ledger.upgrade(&wasm_hash);
+
+    assert_eq!(f.ledger.admin(), f.admin);
+    assert_eq!(f.ledger.registry(), f.registry.address);
+    assert_eq!(f.ledger.get_asset(&f.sac).unwrap().issuer, f.issuer);
+    assert_eq!(f.ledger.get_supply(&f.sac).unwrap().amount, 100 * UNIT);
+    let report = f.ledger.get_report(&f.sac, &Tier::IssuerSigned).unwrap();
+    assert_eq!(report.amount, 100 * UNIT);
+    assert!(f
+        .ledger
+        .is_covered(&f.sac, &10_000, &86_400, &Tier::Transcribed));
+}
+
+// ---- resource budgets -----------------------------------------------------
+
+const RESOURCE_BUDGETS: &str = include_str!("../../../resource-budgets.json");
+
+fn ceiling(function: &str) -> (u64, u64) {
+    let budgets: serde_json::Value =
+        serde_json::from_str(RESOURCE_BUDGETS).expect("resource-budgets.json is valid JSON");
+    let entry = &budgets["functions"][function];
+    (
+        entry["cpu_instructions"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{function} has no cpu_instructions ceiling")),
+        entry["memory_bytes"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{function} has no memory_bytes ceiling")),
+    )
+}
+
+fn assert_within_budget(f: &Fixture, function: &str, call: impl FnOnce()) {
+    f.env.cost_estimate().budget().reset_default();
+    call();
+    let measured = f.env.cost_estimate().budget();
+    let cpu = measured.cpu_instruction_cost();
+    let memory = measured.memory_bytes_cost();
+    let (max_cpu, max_memory) = ceiling(function);
+    std::println!(
+        "{function}: {cpu} CPU instructions, {memory} memory bytes (ceilings {max_cpu}, {max_memory})"
+    );
+    assert!(
+        cpu <= max_cpu,
+        "{function} used {cpu} CPU instructions, over its {max_cpu} ceiling by {}. \
+         Make it cheaper, or raise the ceiling in resource-budgets.json in this commit and say why.",
+        cpu - max_cpu
+    );
+    assert!(
+        memory <= max_memory,
+        "{function} used {memory} memory bytes, over its {max_memory} ceiling by {}. \
+         Make it cheaper, or raise the ceiling in resource-budgets.json in this commit and say why.",
+        memory - max_memory
+    );
+}
+
+#[test]
+fn is_covered_stays_within_its_resource_budget() {
+    let f = listed();
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    f.ledger.post_reserve(
+        &f.issuer,
+        &f.sac,
+        &(100 * UNIT),
+        &T0,
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+    assert_within_budget(&f, "is_covered", || {
+        assert!(f
+            .ledger
+            .is_covered(&f.sac, &10_000, &86_400, &Tier::Transcribed));
+    });
+}
+
+#[test]
+fn post_supply_stays_within_its_resource_budget() {
+    let f = listed();
+    assert_within_budget(&f, "post_supply", || {
+        f.ledger
+            .post_supply(&f.poster, &f.sac, &UNIT, &990, &hash(&f.env, 1));
+    });
+}
+
+#[test]
+fn post_reserve_stays_within_its_resource_budget() {
+    let f = listed();
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    assert_within_budget(&f, "post_reserve", || {
+        f.ledger.post_reserve(
+            &f.auditor,
+            &f.sac,
+            &(100 * UNIT),
+            &T0,
+            &hash(&f.env, 2),
+            &uri(&f.env),
+        );
+    });
 }

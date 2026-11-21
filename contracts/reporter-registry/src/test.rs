@@ -2,9 +2,23 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, Bytes, BytesN, Env, IntoVal, String,
 };
+
+fn upgrade_fixture_wasm() -> std::vec::Vec<u8> {
+    const VENDORED: &[u8] =
+        include_bytes!("../../upgrade-fixture-registry/testdata/upgrade_fixture_registry.wasm");
+    let built = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target/wasm32v1-none/release/upgrade_fixture_registry.wasm");
+    std::fs::read(built).unwrap_or_else(|_| VENDORED.to_vec())
+}
+
+fn upload_upgrade_fixture(env: &Env) -> BytesN<32> {
+    env.deployer()
+        .upload_contract_wasm(Bytes::from_slice(env, &upgrade_fixture_wasm()))
+}
 
 fn setup() -> (Env, Address, ReporterRegistryClient<'static>) {
     let env = Env::default();
@@ -131,4 +145,56 @@ fn set_reporter_without_auth_panics() {
         &Role::Auditor,
         &String::from_str(&env, "x"),
     );
+}
+
+// ---- upgrade --------------------------------------------------------------
+
+#[test]
+fn non_admin_cannot_upgrade() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register(ReporterRegistry, (admin.clone(),));
+    let client = ReporterRegistryClient::new(&env, &id);
+    let wasm_hash = upload_upgrade_fixture(&env);
+    let stranger = Address::generate(&env);
+
+    client.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &id,
+            fn_name: "upgrade",
+            args: (&wasm_hash,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_upgrade(&wasm_hash).is_err());
+
+    // A refused upgrade must leave the old executable and its admin in place.
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+fn admin_upgrade_keeps_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_700_000_000);
+    let admin = Address::generate(&env);
+    let id = env.register(ReporterRegistry, (admin.clone(),));
+    let client = ReporterRegistryClient::new(&env, &id);
+
+    let auditor = Address::generate(&env);
+    client.set_reporter(
+        &auditor,
+        &Role::Auditor,
+        &String::from_str(&env, "Acme Audit LLP"),
+    );
+
+    let wasm_hash = upload_upgrade_fixture(&env);
+    client.upgrade(&wasm_hash);
+
+    assert_eq!(client.admin(), admin);
+    let info = client.get_reporter(&auditor).unwrap();
+    assert_eq!(info.role, Role::Auditor);
+    assert_eq!(info.name, String::from_str(&env, "Acme Audit LLP"));
+    assert_eq!(client.role_of(&auditor), Some(Role::Auditor));
 }
