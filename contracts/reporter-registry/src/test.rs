@@ -1,10 +1,27 @@
 extern crate std;
 
 use super::*;
+#[allow(unused_imports)]
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, Bytes, BytesN, Env, IntoVal, String,
 };
+
+#[allow(dead_code)]
+fn upgrade_fixture_wasm() -> std::vec::Vec<u8> {
+    const VENDORED: &[u8] =
+        include_bytes!("../../upgrade-fixture-registry/testdata/upgrade_fixture_registry.wasm");
+    let built = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target/wasm32v1-none/release/upgrade_fixture_registry.wasm");
+    std::fs::read(built).unwrap_or_else(|_| VENDORED.to_vec())
+}
+
+#[allow(dead_code)]
+fn upload_upgrade_fixture(env: &Env) -> BytesN<32> {
+    env.deployer()
+        .upload_contract_wasm(Bytes::from_slice(env, &upgrade_fixture_wasm()))
+}
 
 fn setup() -> (Env, Address, ReporterRegistryClient<'static>) {
     let env = Env::default();
