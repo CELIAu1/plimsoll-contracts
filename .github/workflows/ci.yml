@@ -35,3 +35,10 @@ jobs:
         run: shellcheck scripts/*.sh
       - name: Test
         run: cargo test
+      # tests/e2e loads the wasm built above with contractimport!, so it is not
+      # a default workspace member and runs only once that wasm exists.
+      - name: Clippy (e2e)
+        run: cargo clippy -p plimsoll-e2e --all-targets -- -D warnings
+      - name: End-to-end scenario against the built wasm
+        run: cargo test -p plimsoll-e2e
+

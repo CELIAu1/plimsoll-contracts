@@ -205,6 +205,22 @@ runs it twice a day and restates the reserves when they are more than three
 days old, which keeps the standing statements in
 [docs/demo](docs/demo) matching what is on chain.
 
+### End-to-end test against the built wasm
+
+The per-contract tests run natively. `tests/e2e` instead loads the three
+compiled contracts from `target/wasm32v1-none/release/`, the same files the
+deploy scripts upload, and runs the whole flow: register reporters, list an
+asset, post supply and reserves, deposit, let the report go stale, deposit
+refused, withdraw still works. It only compiles once the wasm exists, so it is
+not part of a plain `cargo test`:
+
+```bash
+stellar contract build
+cargo test -p plimsoll-e2e
+```
+
+CI runs it straight after the wasm build.
+
 ## Contributing
 
 Issues labelled [`good first issue`](https://github.com/plimsoll-protocol/plimsoll-contracts/labels/good%20first%20issue)
