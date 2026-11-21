@@ -242,8 +242,9 @@ cargo install cargo-llvm-cov --locked
 ./scripts/coverage.sh --html   # also target/coverage/html/index.html
 ```
 
-Test files are left out of the figures, and so is `tests/e2e`: it runs the
-compiled wasm, which carries no coverage instrumentation.
+Test files are left out of the figures, and so are `tests/e2e` (it runs the
+compiled wasm, which carries no coverage instrumentation) and
+`examples/coverage-gate` (documentation, not a deployed contract).
 
 ## Contributing
 

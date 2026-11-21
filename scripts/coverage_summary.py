@@ -100,7 +100,7 @@ def main() -> int:
                 name = f"**{crate}**" if crate == "TOTAL" else f"`{crate}`"
                 out.write(f"| {name} | {lines} | {lp} | {funcs} | {fp} |\n")
             out.write(
-                "\nTest files and the wasm-only e2e crate are excluded. "
+                "\nTest files, `tests/` and `examples/` are excluded. "
                 "The full lcov report is attached to this run as the "
                 "`coverage-lcov` artifact.\n"
             )

@@ -13,8 +13,9 @@
 #   cargo install cargo-llvm-cov --locked
 #
 # Test files are excluded from the figures: a test always "covers" itself.
-# tests/e2e is excluded too. It runs the compiled wasm, which carries no
-# coverage instrumentation, so it would only add noise.
+# cargo-llvm-cov also leaves out tests/ and examples/ by default, which drops
+# tests/e2e (it runs the compiled wasm, which carries no instrumentation) and
+# examples/coverage-gate (documentation, not a deployed contract).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
