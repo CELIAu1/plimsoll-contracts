@@ -26,6 +26,9 @@ is_covered(asset, min_bps, max_age, min_tier) -> bool
 ```
 
 and refuse an asset that is under-backed or whose figures are out of date.
+[docs/INTEGRATING.md](docs/INTEGRATING.md) walks through gating your own
+contract on it: the dependency, the call, choosing each parameter, and the
+edge cases.
 
 | Repo | What it is |
 | --- | --- |

@@ -27,7 +27,7 @@ def crate_of(path: pathlib.Path) -> str:
     except ValueError:
         return str(path)
     parts = rel.parts
-    if len(parts) >= 2 and parts[0] in ("contracts", "crates", "tests"):
+    if len(parts) >= 2 and parts[0] in ("contracts", "crates", "examples", "tests"):
         return f"{parts[0]}/{parts[1]}"
     return parts[0] if parts else str(rel)
 
